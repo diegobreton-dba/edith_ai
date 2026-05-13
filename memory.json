@@ -1,0 +1,15 @@
+{
+  "memory": [
+    {
+      "u": "que es blockchain",
+      "a": "Blockchain es un libro contable digital descentralizado que registra transacciones de forma segura y transparente. Se basa en un conjunto de bloques de datos interconectados que son difíciles de alterar."
+    }
+  ],
+  "current_topic": "blockchain",
+  "last_topic": "blockchain",
+  "response_cache": {
+    "normal:estoicismo:que significa ser estoico": "Ser estoico significa cultivar la resiliencia, la fortaleza y la aceptación de lo que no se puede controlar, enfocándose en la virtud y la razón.",
+    "normal:estoicismo:quiero una idea futurista para edith": "Podría integrar un sistema de reconocimiento de emociones que adapte las respuestas de EDITH a las reacciones del usuario, ofreciendo un apoyo más personalizado.",
+    "normal:blockchain:que es blockchain": "Blockchain es un libro contable digital descentralizado que registra transacciones de forma segura y transparente. Se basa en un conjunto de bloques de datos interconectados que son difíciles de alterar."
+  }
+}

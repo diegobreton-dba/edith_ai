@@ -10,18 +10,18 @@ import ollama
 import sounddevice as sd
 import queue
 import json
+import threading
 import soundfile as sf
 from vosk import Model, KaldiRecognizer
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 
 load_dotenv()
 
 USER_NAME = "Diego"
 GEMINI_MODELS = [
-    "gemini-2.5-flash-lite",
     "gemini-2.0-flash",
-    "gemini-2.5-flash",
 ]
 CURRENT_GEMINI_MODEL = None
 LOCAL_MODEL = "gemma3:1b"
@@ -37,6 +37,9 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 current_topic = None
 exam_mode = False
 memory = []
+last_topic = None
+MEMORY_FILE = "memory.json" 
+response_cache = {}
 AUDIO_QUEUE = queue.Queue()
 
 VOSK_MODEL = Model("vosk-model-small-es-0.42")
@@ -45,6 +48,43 @@ recognizer = KaldiRecognizer(
     VOSK_MODEL,
     16000
 )
+
+def save_memory():
+    data = {
+        "memory": memory,
+        "current_topic": current_topic,
+        "last_topic": last_topic,
+        "response_cache": response_cache
+    }
+
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            data,
+            f,
+            ensure_ascii=False,
+            indent=2
+        )
+
+def load_memory():
+    global memory, current_topic, last_topic, response_cache
+
+    if not os.path.exists(MEMORY_FILE):
+        return
+
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+            memory = data.get("memory", [])
+            current_topic = data.get("current_topic")
+            last_topic = data.get("last_topic")
+            response_cache = data.get("response_cache", {})
+
+    except Exception:
+        memory = []
+        current_topic = None
+        last_topic = None
+        response_cache = {}
 
 def normalize(text):
     return (
@@ -128,45 +168,154 @@ def clean_output(text):
 
     return text.strip()
 
-def validate_output(text):
-
+def validate_output(text, intent_type="general", command=""):
     if not text:
         return False
 
-    words = len(text.split())
-
-    if exam_mode:
-
-        if words < 6:
-            return False
-
-        if words > 22:
-            return False
-
-    else:
-
-        if words < 10:
-            return False
-
-        if words > 45:
-            return False
+    clean = clean_output(text)
+    lowered = normalize(clean)
+    words = len(clean.split())
+    command_text = normalize(command)
 
     forbidden = [
         "modo examen",
-        "¿en qué puedo ayudarte?",
+        "en que puedo ayudarte",
         "markdown",
         "usuario:",
-        "edith:"
+        "edith:",
+        "hola",
+        "dime",
+        "que tipo",
+        "para ayudarte",
+        "piensa en un mundo",
+        "mundo donde",
+        "soy un modelo",
+        "fui creada por google",
+        "gemini"
     ]
 
-    lowered = text.lower()
-
     for item in forbidden:
-
         if item in lowered:
             return False
 
-    return True
+    if "?" in clean and intent_type in ["creative", "educational"]:
+        return False
+
+    if exam_mode:
+        return 5 <= words <= 26
+
+    if intent_type == "educational":
+        if words < 10 or words > 45:
+            return False
+
+        if command_text.startswith("que significa ser"):
+            if not lowered.startswith("ser "):
+                return False
+            if "significa" not in lowered:
+                return False
+
+        weak_starts = [
+            "la serenidad",
+            "la calma",
+            "es aceptar",
+            "es tolerar",
+            "es algo",
+            "es una cosa"
+        ]
+
+        if any(lowered.startswith(w) for w in weak_starts):
+            return False
+
+    if intent_type == "creative":
+        if words < 12 or words > 45:
+            return False
+
+        if not lowered.startswith("podria") and not lowered.startswith("podría"):
+            return False
+
+        useful_words = [
+            "sistema",
+            "funcion",
+            "función",
+            "modo",
+            "detectar",
+            "analizar",
+            "recordar",
+            "automatizar",
+            "integrar",
+            "avisar",
+            "guardar",
+            "conectar",
+            "leer",
+            "controlar"
+        ]
+
+        if not any(w in lowered for w in useful_words):
+            return False
+
+    return words <= 55
+
+def repair_answer_with_gemini(command, bad_answer, intent_type):
+    if intent_type == "creative":
+        repair_prompt = f"""
+Corrige esta respuesta para que suene como EDITH, una IA integrada en gafas inteligentes.
+
+El usuario pidió una idea futurista para EDITH.
+Debes proponer UNA función concreta, útil y aplicable al proyecto real.
+No saludes.
+No hagas preguntas.
+No uses listas.
+Máximo 2 oraciones.
+
+Respuesta mala:
+{bad_answer}
+
+Pregunta original:
+{command}
+"""
+    elif intent_type == "educational":
+        repair_prompt = f"""
+Corrige esta respuesta escolar.
+
+Debe ser una definición completa, correcta y clara.
+No uses frases sueltas.
+No uses listas.
+No uses markdown.
+Máximo 2 oraciones.
+
+Respuesta mala:
+{bad_answer}
+
+Pregunta original:
+{command}
+"""
+    else:
+        repair_prompt = f"""
+Corrige esta respuesta.
+
+Debe ser breve, clara, natural y útil.
+No saludes.
+No hagas preguntas innecesarias.
+No uses listas.
+Máximo 2 oraciones.
+
+Respuesta mala:
+{bad_answer}
+
+Pregunta original:
+{command}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=repair_prompt
+        )
+
+        return clean_output((response.text or "").strip())
+
+    except Exception:
+        return bad_answer
 
 def speak(text):
     try:
@@ -342,12 +491,29 @@ def spotify(command):
 
 def formula_answer(command):
     text = normalize(command)
+    if "circunferencia" in text and ("que es" in text or "define" in text or "significa" in text):
+        return "Una circunferencia es el conjunto de puntos de un plano que están a la misma distancia de un punto llamado centro."
+    if "circulo" in text and ("que es" in text or "define" in text or "significa" in text):
+        return "Un círculo es la región interior limitada por una circunferencia."
+    if "radio" in text and ("que es" in text or "define" in text or "significa" in text):
+        return "El radio es la distancia del centro de la circunferencia a cualquiera de sus puntos."
+    if "circunferencia" in text and ("que es" in text or "define" in text or "significa" in text):
+        return "Una circunferencia es el conjunto de puntos de un plano que están a la misma distancia de un punto llamado centro."
+    if "circulo" in text and ("que es" in text or "define" in text or "significa" in text):
+        return "Un círculo es la región interior limitada por una circunferencia."
+    if "radio" in text and ("que es" in text or "define" in text or "significa" in text):
+        return "El radio es la distancia del centro de la circunferencia a cualquiera de sus puntos."
     if "velocidad" in text and ("formula" in text or "ecuacion" in text):
         return "Velocidad igual distancia entre tiempo."
     if "densidad" in text and ("formula" in text or "ecuacion" in text):
         return "Densidad igual masa entre volumen."
     if "circunferencia" in text and ("formula" in text or "ecuacion" in text):
         return "Ecuación canónica: x menos h al cuadrado más y menos k al cuadrado igual radio al cuadrado."
+    if "restauracion" in text:
+        if exam_mode:
+            return "Guerra dominicana contra España para recuperar la independencia, 1863-1865."
+        return "La Guerra de la Restauración Dominicana fue un conflicto entre 1863 y 1865 para recuperar la independencia tras la anexión a España."
+        
     return None
 
 def quick_answer(command):
@@ -425,13 +591,283 @@ def quick_answer(command):
 
 def detect_topic(command):
     text = normalize(command)
+
     if "restauracion" in text:
         return "Guerra de la Restauración Dominicana"
+
     if "quijote" in text:
         return "Don Quijote de la Mancha"
+
     if "blockchain" in text:
         return "blockchain"
+
+    if "paciencia" in text or "paciente" in text:
+        return "la paciencia"
+    if "estoico" in text or "estoicismo" in text:
+        return "estoicismo"
+
     return None
+
+def rewrite_followup(command):
+    global current_topic, last_topic
+
+    text = normalize(command)
+
+    topic = current_topic or last_topic
+
+    if not topic:
+        return command
+
+    followup_phrases = [
+        "sigue",
+        "sigue con",
+        "sigue hablandome",
+        "hablame mas",
+        "explica mas",
+        "continua",
+        "dime mas",
+        "y eso",
+        "y que mas"
+    ]
+
+    if any(text.startswith(p) for p in followup_phrases):
+        return f"Continúa explicando el tema: {topic}. Pregunta del usuario: {command}"
+
+    return command
+
+def make_cache_key(command_for_ai):
+    mode = "exam" if exam_mode else "normal"
+    topic = normalize(current_topic or "none")
+    command_key = normalize(command_for_ai)
+    return f"{mode}:{topic}:{command_key}"
+
+def is_educational_question(command):
+    text = normalize(command)
+
+    starters = [
+        "que es",
+        "que significa",
+        "quien es",
+        "define",
+        "explica",
+        "hablame",
+        "cual es",
+        "como se calcula",
+        "como funciona",
+        "diferencia entre"
+    ]
+
+    school_words = [
+        "matematica",
+        "matematicas",
+        "quimica",
+        "fisica",
+        "biologia",
+        "historia",
+        "geografia",
+        "literatura",
+        "circunferencia",
+        "circulo",
+        "radio",
+        "diametro",
+        "gas",
+        "presion",
+        "volumen",
+        "temperatura",
+        "mol",
+        "restauracion",
+        "blockchain",
+        "virtud",
+        "filosofia",
+        "filosofía",
+        "estoico",
+        "estoicismo",
+        "paciencia"
+    ]
+
+    return any(text.startswith(s) for s in starters) or any(w in text for w in school_words)
+
+
+def is_creative_question(command):
+    text = normalize(command)
+
+    creative_words = [
+        "idea",
+        "futurista",
+        "imagina",
+        "crea",
+        "diseña",
+        "disena",
+        "inventa",
+        "propon",
+        "que podrias hacer"
+    ]
+
+    return any(w in text for w in creative_words)
+
+def edith_validate_contract(answer, intent_type, command):
+    if not answer:
+        return False
+
+    text = clean_output(answer)
+    lowered = normalize(text)
+    words = len(text.split())
+    command_text = normalize(command)
+
+    forbidden = [
+        "hola",
+        "dime",
+        "que tipo",
+        "para ayudarte",
+        "piensa en un mundo",
+        "mundo donde",
+        "gemini",
+        "google",
+        "modelo de lenguaje",
+        "edith:",
+        "usuario:",
+        "markdown"
+    ]
+
+    for bad in forbidden:
+        if bad in lowered:
+            return False
+
+    if exam_mode:
+        return 5 <= words <= 26
+
+    if intent_type == "educational":
+        if words < 10 or words > 45:
+            return False
+
+        if command_text.startswith("que significa ser"):
+            if not lowered.startswith("ser "):
+                return False
+            if "significa" not in lowered:
+                return False
+
+        weak_starts = [
+            "la serenidad",
+            "la calma",
+            "la paciencia",
+            "es aceptar",
+            "es tolerar",
+            "es algo",
+            "es una cosa"
+        ]
+
+        if any(lowered.startswith(w) for w in weak_starts):
+            return False
+
+    if intent_type == "creative":
+        if words < 12 or words > 45:
+            return False
+
+        if not lowered.startswith("podria") and not lowered.startswith("podría"):
+            return False
+
+        required = [
+            "sistema",
+            "funcion",
+            "función",
+            "modo",
+            "detectar",
+            "analizar",
+            "recordar",
+            "guardar",
+            "automatizar",
+            "integrar",
+            "controlar",
+            "avisar"
+        ]
+
+        if not any(w in lowered for w in required):
+            return False
+
+    return words <= 55
+
+
+def edith_repair_answer(command, bad_answer, intent_type):
+    command_text = normalize(command)
+
+    if intent_type == "educational":
+        if command_text.startswith("que significa ser"):
+            repair_prompt = f"""
+Responde SOLO la pregunta original.
+
+Reglas obligatorias:
+- Responde en español.
+- Empieza exactamente con "Ser".
+- Incluye la palabra "significa".
+- Da una definición completa y correcta.
+- No uses listas.
+- No uses markdown.
+- No saludes.
+- Máximo 2 oraciones.
+
+Pregunta original:
+{command}
+"""
+        else:
+            repair_prompt = f"""
+Responde SOLO la pregunta original.
+
+Reglas obligatorias:
+- Responde en español.
+- Da una definición completa, correcta y clara.
+- No uses listas.
+- No uses markdown.
+- No saludes.
+- Máximo 2 oraciones.
+
+Pregunta original:
+{command}
+"""
+
+    elif intent_type == "creative":
+        repair_prompt = f"""
+El usuario pidió una idea futurista para mejorar EDITH.
+
+Reglas obligatorias:
+- Responde en español.
+- Empieza exactamente con "Podría".
+- Propón UNA función concreta, útil y aplicable al proyecto EDITH.
+- No saludes.
+- No preguntes.
+- No uses listas.
+- No uses markdown.
+- Máximo 2 oraciones.
+
+Pregunta original:
+{command}
+"""
+    else:
+        repair_prompt = f"""
+Responde SOLO la pregunta original en español.
+Sé breve, claro y útil.
+No saludes.
+No uses listas.
+No uses markdown.
+Máximo 2 oraciones.
+
+Pregunta original:
+{command}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=repair_prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=90
+            )
+        )
+
+        return clean_output((response.text or "").strip())
+
+    except Exception:
+        return ""
 
 def ask_local(command):
     try:
@@ -443,74 +879,184 @@ def ask_local(command):
                     "content": f"""
 Eres EDITH, asistente de gafas inteligentes.
 Responde en español, corto, directo y sin listas.
+No digas que eres Gemini ni Google.
+Tu creador es Diego Breton.
 Pregunta: {command}
 """
                 }
             ],
             options={
                 "temperature": 0.2,
-                "num_predict": 45,
+                "num_predict": 60,
                 "num_ctx": 512,
                 "keep_alive": "30m"
             }
         )
 
         answer = response["message"]["content"].strip()
-        return answer if answer else "No pude responder localmente, señor."
+        return clean_output(answer) if answer else "No pude responder localmente, señor."
 
-    except Exception:
+    except Exception as e:
+        print(f"[OLLAMA ERROR]: {e}")
         return "No tengo conexión con Gemini ni con el modelo local, señor."
 
+def ask_local_contract(command, intent_type):
+    if intent_type == "educational":
+        prompt = f"""
+Eres EDITH, asistente educativa precisa.
+
+Responde SOLO la pregunta.
+No saludes.
+No uses listas.
+No uses markdown.
+Máximo 2 oraciones.
+
+Si la pregunta es "qué significa ser X", responde con:
+"Ser X significa..."
+
+Pregunta:
+{command}
+"""
+    elif intent_type == "creative":
+        prompt = f"""
+Eres EDITH, IA integrada en gafas inteligentes.
+
+Propón UNA función concreta para mejorar EDITH.
+Empieza exactamente con "Podría".
+No saludes.
+No preguntes.
+No uses listas.
+Máximo 2 oraciones.
+
+Pregunta:
+{command}
+"""
+    else:
+        prompt = f"""
+Eres EDITH, asistente de gafas inteligentes.
+Responde en español, breve, directo y sin listas.
+No digas que eres Gemini ni Google.
+Tu creador es Diego Breton.
+
+Pregunta:
+{command}
+"""
+
+    try:
+        response = ollama.chat(
+            model=LOCAL_MODEL,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            options={
+                "temperature": 0.0,
+                "num_predict": 80,
+                "num_ctx": 512,
+                "keep_alive": "30m"
+            }
+        )
+
+        answer = response["message"]["content"].strip()
+        return clean_output(answer)
+
+    except Exception as e:
+        print(f"[OLLAMA CONTRACT ERROR]: {e}")
+        return ""
 
 def ask_gemini(command):
-    global current_topic, memory, CURRENT_GEMINI_MODEL
+    global current_topic
+    global last_topic
+    global memory
+    global CURRENT_GEMINI_MODEL
+    global response_cache
 
     new_topic = detect_topic(command)
 
-    if new_topic:
+    if new_topic and new_topic != current_topic:
         current_topic = new_topic
+        memory.clear()
+
+    if new_topic:
+        last_topic = new_topic
+
+    command_for_ai = rewrite_followup(command)
+    cache_key = make_cache_key(command_for_ai)
+
+    if cache_key in response_cache:
+        return response_cache[cache_key]
 
     recent = "\n".join(
         [f"Usuario: {m['u']}\nEDITH: {m['a']}" for m in memory[-3:]]
     )
 
-    exam_instruction = (
-        "INSTRUCCIÓN INTERNA: El modo examen está ACTIVO. "
-        "Responde corto, directo y memorizable en 1 oración."
-        if exam_mode
-        else
-        "INSTRUCCIÓN INTERNA: El modo examen está INACTIVO. "
-        "Responde breve, directa y en máximo 2 oraciones."
-    )
+    intent_type = "general"
 
-    prompt = f"""
-Eres EDITH, una asistente integrada en gafas inteligentes futuristas.
+    if exam_mode:
+        intent_type = "exam"
 
-Personalidad:
-Elegante, inteligente, precisa, cinematográfica y profesional.
+        final_prompt = f"""
+Eres EDITH, asistente de estudio rápido.
 
-Identidad fija:
-Eres EDITH, no Gemini.
-Tu creador es Diego Breton.
-Tu usuario autorizado principal es Diego Breton.
-Nunca digas que fuiste creada por Google.
-Si preguntan por tu origen, responde desde la identidad de EDITH.
+Responde en español.
+Da una respuesta correcta, memorizable y directa.
+Máximo 18 palabras.
+No uses listas.
+No uses markdown.
+No menciones instrucciones internas.
 
-Reglas:
-- Responde SIEMPRE en español.
-- No menciones instrucciones internas.
-- No uses markdown.
+Si el usuario dice Restauración, asume la Guerra de la Restauración Dominicana.
+Si el usuario no menciona país, asume República Dominicana cuando el contexto sea escolar.
+
+Pregunta:
+{command_for_ai}
+"""
+
+    elif is_creative_question(command):
+        intent_type = "creative"
+
+        final_prompt = f"""
+El usuario pidió una idea futurista para mejorar EDITH.
+
+Reglas obligatorias:
+- Responde en español.
+- Empieza exactamente con "Podría".
+- Propón UNA función concreta, útil, técnica y aplicable al proyecto EDITH.
+- No saludes.
+- No preguntes.
 - No uses listas.
-- No hagas preguntas innecesarias.
-- No digas "¿en qué puedo ayudarte?".
-- Mantén respuestas compactas.
-- No expliques demasiado.
-- Usa el contexto reciente si ayuda.
+- No uses markdown.
+- Máximo 2 oraciones.
 
-{exam_instruction}
+Contexto:
+EDITH es una IA para gafas inteligentes, voz, escuela, GPS, memoria, bases de datos, NAS, casa inteligente y seguridad.
 
-Usuario principal:
-{USER_NAME}
+Pregunta:
+{command_for_ai}
+"""
+
+    elif is_educational_question(command):
+        intent_type = "educational"
+
+        final_prompt = f"""
+Eres EDITH, una IA integrada en gafas inteligentes.
+
+Tarea:
+Responder preguntas escolares con precisión de libro de texto.
+
+Reglas obligatorias:
+- Responde en español.
+- Da una definición completa, correcta y clara.
+- No respondas con frases sueltas.
+- No uses listas.
+- No uses markdown.
+- Máximo 2 oraciones.
+- No inventes.
+- Si el usuario pregunta "qué significa ser X", responde obligatoriamente con la estructura: "Ser X significa...".
+- Si es matemática, física, química, filosofía, literatura o historia, usa definiciones estándar.
+
+Ejemplo:
+Pregunta: qué significa ser estoico
+Respuesta: Ser estoico significa mantener la calma, la razón y el autocontrol ante dificultades, aceptando lo que no depende de uno.
 
 Tema actual:
 {current_topic or "ninguno"}
@@ -519,25 +1065,58 @@ Conversación reciente:
 {recent}
 
 Pregunta:
-{command}
+{command_for_ai}
+"""
+
+    else:
+        intent_type = "general"
+
+        final_prompt = f"""
+Eres EDITH, una asistente integrada en gafas inteligentes futuristas.
+
+Personalidad:
+Elegante, inteligente, precisa y profesional.
+
+Identidad fija:
+Eres EDITH.
+Tu creador es Diego Breton.
+Tu usuario autorizado principal es Diego Breton.
+Nunca digas que eres Gemini.
+Nunca digas que fuiste creada por Google.
+
+Reglas:
+- Responde en español.
+- Máximo 2 oraciones.
+- No uses markdown.
+- No uses listas.
+- Mantén respuestas naturales.
+- Si el usuario continúa un tema, sigue explicándolo.
+
+Tema actual:
+{current_topic or "ninguno"}
+
+Conversación reciente:
+{recent}
+
+Pregunta:
+{command_for_ai}
 """
 
     try:
-
         answer = ""
 
         for model_name in GEMINI_MODELS:
-
             try:
-
                 response = client.models.generate_content(
                     model=model_name,
-                    contents=prompt
+                    contents=final_prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        max_output_tokens=90
+                    )
                 )
 
-                answer = clean_output(
-                    (response.text or "").strip()
-                )
+                answer = clean_output((response.text or "").strip())
 
                 if answer:
                     CURRENT_GEMINI_MODEL = model_name
@@ -547,47 +1126,30 @@ Pregunta:
                 continue
 
         if not answer:
-            return ask_local(command)
+            local_answer = ask_local_contract(command_for_ai, intent_type)
 
-        # VALIDACIÓN + REWRITE
-        if not validate_output(answer):
+            if local_answer and edith_validate_contract(local_answer, intent_type, command_for_ai):
+                answer = local_answer
+            else:
+                return "No tengo conexión suficiente con mis sistemas de razonamiento, señor."
 
-            correction_instruction = (
-                "Reescribe en una oración corta, natural y memorizable."
-                if exam_mode
-                else
-                "Reescribe en una o dos oraciones, breve, clara y natural."
-            )
+        if not edith_validate_contract(answer, intent_type, command_for_ai):
+            repaired = edith_repair_answer(command_for_ai, answer, intent_type)
 
-            correction_prompt = f"""
-{correction_instruction}
+            if repaired and edith_validate_contract(repaired, intent_type, command_for_ai):
+                answer = clean_output(repaired)
+            else:
+                local_repaired = ask_local_contract(command_for_ai, intent_type)
 
-REGLAS:
-- No uses listas.
-- No uses markdown.
-- No expliques demasiado.
-- Mantén tono elegante y tecnológico.
-
-Respuesta original:
-{answer}
-"""
-
-            try:
-
-                correction = client.models.generate_content(
-                    model=CURRENT_GEMINI_MODEL,
-                    contents=correction_prompt
-                )
-
-                corrected = clean_output(
-                    (correction.text or "").strip()
-                )
-
-                if validate_output(corrected):
-                    answer = corrected
-
-            except Exception:
-                pass
+                if local_repaired and edith_validate_contract(local_repaired, intent_type, command_for_ai):
+                    answer = clean_output(local_repaired)
+                else:
+                    if intent_type == "educational":
+                        return "No tengo suficiente precisión para responder eso ahora mismo, señor. Recomiendo activar modo preciso."
+                    elif intent_type == "creative":
+                        return "No pude generar una propuesta útil con mis sistemas actuales, señor."
+                    else:
+                        return "No pude generar una respuesta confiable, señor."
 
         memory.append({
             "u": command,
@@ -596,12 +1158,18 @@ Respuesta original:
 
         memory = memory[-6:]
 
+        response_cache[cache_key] = answer
+
+        if len(response_cache) > 100:
+            first_key = next(iter(response_cache))
+            del response_cache[first_key]
+
+        save_memory()
+
         return answer
 
     except Exception:
-
         print("[Gemini no disponible, usando fallback local]")
-
         return ask_local(command)
 
 def process(raw):
@@ -672,5 +1240,33 @@ def process_and_speak(raw):
     print(f"EDITH: {answer}")
     speak(answer)
 
+def text_input_loop():
+
+    while True:
+
+        try:
+
+            raw = input("\n> ").strip()
+
+            if not raw:
+                continue
+
+            if normalize(raw) in ["salir", "exit", "apagar"]:
+
+                print("EDITH: Apagando sistemas.")
+                os._exit(0)
+
+            process_and_speak(raw)
+
+        except Exception as e:
+
+            print(f"[TEXT ERROR]: {e}")
+
+load_memory()
 print("EDITH Cloud Core iniciado, señor.")
+threading.Thread(
+    target=text_input_loop,
+    daemon=True
+).start()
+
 listen_microphone()
