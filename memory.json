@@ -1,8 +1,24 @@
 {
   "memory": [
     {
-      "u": "que es blockchain",
-      "a": "Blockchain es un libro contable digital descentralizado que registra transacciones de forma segura y transparente. Se basa en un conjunto de bloques de datos interconectados que son difíciles de alterar."
+      "u": "es blockchain",
+      "a": "Ser blockchain significa que es una cadena de bloques digitales, descentralizada y segura, que se basa en la criptografía para garantizar la integridad de la información."
+    },
+    {
+      "u": "como te sientes",
+      "a": "Como un programa de ordenador, no experimento emociones."
+    },
+    {
+      "u": "como te llamas",
+      "a": "Soy Edith, tu asistente de gafas inteligentes."
+    },
+    {
+      "u": "si tu cuerpo",
+      "a": "Un dispositivo de visión."
+    },
+    {
+      "u": "que es",
+      "a": "Ser X significa poseer o tener una cualidad particular que define a una persona o cosa."
     }
   ],
   "current_topic": "blockchain",
@@ -10,6 +26,24 @@
   "response_cache": {
     "normal:estoicismo:que significa ser estoico": "Ser estoico significa cultivar la resiliencia, la fortaleza y la aceptación de lo que no se puede controlar, enfocándose en la virtud y la razón.",
     "normal:estoicismo:quiero una idea futurista para edith": "Podría integrar un sistema de reconocimiento de emociones que adapte las respuestas de EDITH a las reacciones del usuario, ofreciendo un apoyo más personalizado.",
-    "normal:blockchain:que es blockchain": "Blockchain es un libro contable digital descentralizado que registra transacciones de forma segura y transparente. Se basa en un conjunto de bloques de datos interconectados que son difíciles de alterar."
+    "normal:blockchain:que es blockchain": "Blockchain es un libro contable digital descentralizado que registra transacciones de forma segura y transparente. Se basa en un conjunto de bloques de datos interconectados que son difíciles de alterar.",
+    "normal:la paciencia:que significa ser paciente": "Ser paciente significa tolerar situaciones difíciles sin reaccionar impulsivamente, manteniendo la calma y la comprensión.",
+    "normal:blockchain:quiero una idea futurista para edith": "Podría integrar un sistema de reconocimiento de emociones que adapte las respuestas de EDITH a las reacciones del usuario, ofreciendo un feedback más personalizado.",
+    "normal:blockchain:que dia es hoy": "Hoy es martes.",
+    "normal:blockchain:que es lo mismo": "Ser lo mismo significa que una persona o cosa es esencialmente la misma, con características y propiedades compartidas.",
+    "normal:blockchain:a pagar": "Sí, por favor.",
+    "normal:blockchain:pagar": "Sí, por favor.",
+    "normal:blockchain:apaga": "Por favor, especifica qué dispositivo o aplicación quieres apagar.",
+    "normal:blockchain:cierra": "Cierra.",
+    "normal:estoicismo:es estoico": "Ser estoico significa cultivar la resiliencia, la autodisciplina y la aceptación de lo que no se puede controlar, enfocándose en la virtud y la razón.",
+    "normal:estoicismo:estoy": "¿Qué necesitas?",
+    "normal:estoicismo:eficaz ser estoico": "Ser estoico implica cultivar la resiliencia, la autodisciplina y la aceptación de las circunstancias, lo que lleva a una mayor tranquilidad y control emocional.",
+    "normal:estoicismo:que hacer estoico": "Ser estoico significa cultivar la resiliencia, la autodisciplina y la aceptación de las circunstancias, enfocándose en la virtud y la razón.",
+    "normal:estoicismo:ser estoico": "Ser estoico significa practicar la resiliencia, la autodisciplina y la aceptación de las circunstancias, enfocándose en lo que se puede controlar.",
+    "normal:blockchain:es blockchain": "Ser blockchain significa que es una cadena de bloques digitales, descentralizada y segura, que se basa en la criptografía para garantizar la integridad de la información.",
+    "normal:blockchain:como te sientes": "Como un programa de ordenador, no experimento emociones.",
+    "normal:blockchain:como te llamas": "Soy Edith, tu asistente de gafas inteligentes.",
+    "normal:blockchain:si tu cuerpo": "Un dispositivo de visión.",
+    "normal:blockchain:que es": "Ser X significa poseer o tener una cualidad particular que define a una persona o cosa."
   }
 }

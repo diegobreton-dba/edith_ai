@@ -11,6 +11,9 @@ import sounddevice as sd
 import queue
 import json
 import threading
+import webrtcvad
+import numpy as np
+import noisereduce as nr
 import soundfile as sf
 from vosk import Model, KaldiRecognizer
 from dotenv import load_dotenv
@@ -26,6 +29,7 @@ GEMINI_MODELS = [
 CURRENT_GEMINI_MODEL = None
 LOCAL_MODEL = "gemma3:1b"
 WAKE_WORDS = ["edith", "edit", "edid", "edif"]
+WAKE_GRAMMAR = json.dumps(WAKE_WORDS + ["[unk]"], ensure_ascii=False)
 VOICE_ENABLED = True
 VOICE = "es-ES-ElviraNeural"
 VOICE_RATE = "+5%"
@@ -48,6 +52,29 @@ recognizer = KaldiRecognizer(
     VOSK_MODEL,
     16000
 )
+SAMPLE_RATE = 16000
+FRAME_DURATION_MS = 30
+FRAME_BYTES = int(SAMPLE_RATE * FRAME_DURATION_MS / 1000) * 2
+
+VAD_MODE = 2
+vad = webrtcvad.Vad(VAD_MODE)
+
+MIN_SPEECH_FRAMES = 8
+END_SILENCE_FRAMES = 14
+
+MAX_UTTERANCE_SECONDS = 9
+MAX_UTTERANCE_BYTES = SAMPLE_RATE * 2 * MAX_UTTERANCE_SECONDS
+
+DORMANT_MAX_UTTERANCE_SECONDS = 3
+DORMANT_MAX_UTTERANCE_BYTES = SAMPLE_RATE * 2 * DORMANT_MAX_UTTERANCE_SECONDS
+LAST_INTERACTION_TIME = 0
+FOLLOWUP_WINDOW = 5
+
+SYSTEM_BUSY = False
+ACK_VOICE_ON_WAKE = False
+
+NOISE_SUPPRESSION_ENABLED = False
+NOISE_REDUCTION_STRENGTH = 0.35
 
 def save_memory():
     data = {
@@ -94,6 +121,51 @@ def normalize(text):
         .replace("¿", "").replace("?", "").replace("¡", "").replace("!", "")
         .replace(",", "").replace(".", "")
     )
+
+def normalize_command_text(text):
+    text = normalize(text)
+
+    replacements = {
+        "bloque": "que es blockchain",
+        "block chain": "que es blockchain",
+        "bloque chain": "que es blockchain",
+        "blochen": "que es blockchain",
+        "bloc chain": "que es blockchain",
+        "que es bloque": "que es blockchain",
+        "que es block chain": "que es blockchain",
+
+        "es blockchain": "que es blockchain",
+        "ser blockchain": "que es blockchain",
+        "edith es blockchain": "edith que es blockchain",
+
+        "que hacer estoico": "que significa ser estoico",
+        "eficaz ser estoico": "que significa ser estoico",
+        "es estoico": "que significa ser estoico",
+        "ser estoico": "que significa ser estoico",
+    }
+
+    if text in replacements:
+        return replacements[text]
+
+    # Corrección general:
+    # Si Vosk perdió el "qué" al inicio y dejó "es X",
+    # lo convertimos en "qué es X".
+    if text.startswith("es ") and len(text.split()) <= 4:
+        return "que " + text
+
+    return text
+
+def normalize_awake_command_text(text):
+    text = normalize_command_text(text)
+
+    # Correcciones de comandos cortos que Vosk suele cortar.
+    if text == "que es":
+        return "que eres"
+
+    if text == "quien es":
+        return "quien eres"
+
+    return text
 
 def ideal_length(text):
 
@@ -343,6 +415,309 @@ def audio_callback(indata, frames, time, status):
 
     AUDIO_QUEUE.put(bytes(indata))
 
+def clear_audio_queue():
+    cleared = 0
+
+    while True:
+        try:
+            AUDIO_QUEUE.get_nowait()
+            cleared += 1
+        except queue.Empty:
+            break
+
+    return cleared
+
+def collect_extra_audio(seconds=0.8):
+    extra_audio = b""
+    end_time = time.time() + seconds
+
+    while time.time() < end_time:
+        remaining = end_time - time.time()
+
+        try:
+            data = AUDIO_QUEUE.get(timeout=max(0.01, remaining))
+            extra_audio += data
+        except queue.Empty:
+            break
+
+    return extra_audio
+
+def collect_after_wake_audio(max_seconds=1.8):
+    extra_audio = b""
+    audio_remainder = b""
+    silence_frames = 0
+    speech_started = False
+
+    end_time = time.time() + max_seconds
+
+    while time.time() < end_time:
+        try:
+            data = AUDIO_QUEUE.get(timeout=0.05)
+        except queue.Empty:
+            continue
+
+        extra_audio += data
+        audio_remainder += data
+
+        frames, audio_remainder = split_audio_frames(audio_remainder)
+
+        for frame in frames:
+            try:
+                is_speech = vad.is_speech(frame, SAMPLE_RATE)
+            except Exception:
+                continue
+
+            if is_speech:
+                speech_started = True
+                silence_frames = 0
+            else:
+                if speech_started:
+                    silence_frames += 1
+
+            # Si ya empezó a hablar después de "edith" y luego hubo silencio,
+            # asumimos que terminó la pregunta.
+            if speech_started and silence_frames >= END_SILENCE_FRAMES:
+                return extra_audio
+
+    return extra_audio
+
+def split_audio_frames(audio_bytes):
+    frames = []
+
+    while len(audio_bytes) >= FRAME_BYTES:
+        frames.append(audio_bytes[:FRAME_BYTES])
+        audio_bytes = audio_bytes[FRAME_BYTES:]
+
+    return frames, audio_bytes
+
+def suppress_noise_audio(audio_bytes):
+    if not NOISE_SUPPRESSION_ENABLED:
+        return audio_bytes
+
+    try:
+        audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+
+        if len(audio_np) < SAMPLE_RATE * 0.25:
+            return audio_bytes
+
+        audio_float = audio_np.astype(np.float32) / 32768.0
+
+        reduced = nr.reduce_noise(
+            y=audio_float,
+            sr=SAMPLE_RATE,
+            stationary=True,
+            prop_decrease=NOISE_REDUCTION_STRENGTH
+        )
+
+        reduced = np.clip(reduced, -1.0, 1.0)
+        reduced_int16 = (reduced * 32767).astype(np.int16)
+
+        return reduced_int16.tobytes()
+
+    except Exception as e:
+        print(f"[Noise Suppression Error]: {e}")
+        return audio_bytes
+
+def is_weak_transcription(text):
+    text = normalize(text)
+
+    if not text:
+        return True
+
+    words = text.split()
+
+    weak_phrases = [
+        "ah",
+        "eh",
+        "mmm",
+        "de",
+        "la",
+        "el",
+        "lo",
+        "que",
+        "y",
+        "a",
+        "para",
+        "it"
+    ]
+
+    if text in weak_phrases:
+        return True
+
+    if len(words) <= 1 and text not in WAKE_WORDS:
+        return True
+
+    if len(words) <= 2 and not any(w in text for w in WAKE_WORDS):
+        return True
+
+    return False
+
+
+def vosk_transcribe_raw(audio_bytes):
+    if not audio_bytes:
+        return ""
+
+    local_recognizer = KaldiRecognizer(
+        VOSK_MODEL,
+        SAMPLE_RATE
+    )
+
+    local_recognizer.AcceptWaveform(audio_bytes)
+
+    result = json.loads(
+        local_recognizer.FinalResult()
+    )
+
+    return normalize(
+        result.get("text", "")
+    )
+
+
+def transcribe_vosk_audio(audio_bytes, use_noise_suppression=False):
+    if not audio_bytes:
+        return ""
+
+    # Primero intenta con audio normal.
+    raw_text = vosk_transcribe_raw(audio_bytes)
+
+    # Si no estamos usando noise suppression, devuelve raw.
+    if not use_noise_suppression:
+        return raw_text
+
+    # Si el raw salió bien, no lo dañes con noise suppression.
+    if raw_text and not is_weak_transcription(raw_text):
+        return raw_text
+
+    # Si salió débil, intenta con audio limpiado.
+    cleaned_audio = suppress_noise_audio(audio_bytes)
+    cleaned_text = vosk_transcribe_raw(cleaned_audio)
+
+    if cleaned_text and not is_weak_transcription(cleaned_text):
+        return cleaned_text
+
+    # Si ambos son flojos, devuelve el raw para no inventar más.
+    return raw_text or cleaned_text
+
+def transcribe_wake_audio(audio_bytes):
+    if not audio_bytes:
+        return ""
+
+    try:
+        wake_recognizer = KaldiRecognizer(
+            VOSK_MODEL,
+            SAMPLE_RATE,
+            WAKE_GRAMMAR
+        )
+
+        wake_recognizer.AcceptWaveform(audio_bytes)
+
+        result = json.loads(
+            wake_recognizer.FinalResult()
+        )
+
+        text = normalize(
+            result.get("text", "")
+        )
+
+        text = text.replace("[unk]", "").strip()
+
+        return text
+
+    except Exception:
+        return ""
+
+
+def has_wake_word(text):
+    words = normalize(text).split()
+
+    return any(
+        word in WAKE_WORDS
+        for word in words
+    )
+
+
+def looks_like_command(text):
+    text = normalize_awake_command_text(text)
+
+    if not text:
+        return False
+
+    short_commands = [
+        "como te llamas",
+        "cual es tu nombre",
+        "como estas",
+        "quien eres",
+        "que eres",
+        "modo examen",
+        "estado sistema",
+        "estado del sistema",
+        "spotify",
+    ]
+
+    if text in short_commands:
+        return True
+
+    incomplete_questions = [
+        "que es",
+        "quien es",
+        "que significa",
+        "que significa ser",
+        "como se",
+        "cual es",
+        "donde esta",
+    ]
+
+    if text in incomplete_questions:
+        return False
+
+    identity_phrases = [
+        "quien te creo",
+        "quien te hizo",
+        "quien te desarrollo",
+        "quien soy",
+        "donde estan tus servidores",
+        "que puedes hacer",
+    ]
+
+    if any(text.startswith(p) for p in identity_phrases):
+        return True
+
+    if detect_topic(text):
+        return True
+
+    if formula_answer(text):
+        return True
+
+    if text.startswith("reproduce") or text.startswith("pon "):
+        return True
+
+    command_starts = [
+        "que ",
+        "quien ",
+        "cuando ",
+        "donde ",
+        "como ",
+        "cual ",
+        "cuanto ",
+        "define ",
+        "explica ",
+        "hablame ",
+        "dime ",
+        "quiero ",
+        "necesito ",
+        "busca ",
+        "abre ",
+        "activa ",
+        "desactiva ",
+        "calcula ",
+        "resuelve ",
+    ]
+
+    if any(text.startswith(start) for start in command_starts):
+        return True
+
+    return False
+
 def record_command(seconds=6):
 
     print("Escuchando comando...")
@@ -366,42 +741,20 @@ def record_command(seconds=6):
 
     return filename
 
-def transcribe_audio_gemini(audio_path):
-
-    try:
-
-        uploaded_file = client.files.upload(
-            file=audio_path
-        )
-
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[
-                "Transcribe exactamente este audio en español.",
-                uploaded_file
-            ]
-        )
-
-        text = normalize(
-            response.text.strip()
-        )
-
-        return text
-
-    except Exception as e:
-
-        print(f"[STT ERROR]: {e}")
-
-        return ""
-
 def listen_microphone():
     waiting_for_command = False
     last_wake_time = 0
-    command_timeout = 8
+    command_timeout = 10
+
+    audio_remainder = b""
+    utterance_frames = []
+    silence_frames = 0
+    speech_frames = 0
+    is_recording_speech = False
 
     with sd.RawInputStream(
-        samplerate=16000,
-        blocksize=8000,
+        samplerate=SAMPLE_RATE,
+        blocksize=480,
         dtype="int16",
         channels=1,
         callback=audio_callback
@@ -411,70 +764,167 @@ def listen_microphone():
 
         while True:
             data = AUDIO_QUEUE.get()
+            if SYSTEM_BUSY:
+                clear_audio_queue()
+                audio_remainder = b""
+                utterance_frames = []
+                silence_frames = 0
+                speech_frames = 0
+                is_recording_speech = False
+                continue
+            audio_remainder += data
 
-            if recognizer.AcceptWaveform(data):
-                result = json.loads(recognizer.Result())
-                raw_text = result.get("text", "")
-                text = normalize(raw_text)
+            frames, audio_remainder = split_audio_frames(audio_remainder)
+
+            for frame in frames:
+                try:
+                    is_speech = vad.is_speech(frame, SAMPLE_RATE)
+                except Exception:
+                    continue
+
+                if is_speech:
+                    if not is_recording_speech:
+                        utterance_frames = []
+                        silence_frames = 0
+                        speech_frames = 0
+                        is_recording_speech = True
+
+                    utterance_frames.append(frame)
+                    speech_frames += 1
+                    silence_frames = 0
+
+                else:
+                    if is_recording_speech:
+                        utterance_frames.append(frame)
+                        silence_frames += 1
+
+                if not is_recording_speech:
+                    continue
+
+                total_audio = b"".join(utterance_frames)
+
+                current_limit = (
+                    MAX_UTTERANCE_BYTES
+                    if waiting_for_command
+                    else DORMANT_MAX_UTTERANCE_BYTES
+                )
+
+                too_long = len(total_audio) >= current_limit
+                finished = silence_frames >= END_SILENCE_FRAMES
+
+                if not finished and not too_long:
+                    continue
+
+                is_recording_speech = False
+
+                if speech_frames < MIN_SPEECH_FRAMES:
+                    utterance_frames = []
+                    silence_frames = 0
+                    speech_frames = 0
+                    continue
+
+                now = time.time()
+
+                # MODO DORMIDA:
+                # No transcribe conversaciones completas.
+                # Solo busca wake word con gramática cerrada.
+                if not waiting_for_command:
+                    wake_text = transcribe_wake_audio(total_audio)
+
+                    utterance_frames = []
+                    silence_frames = 0
+                    speech_frames = 0
+
+                    if not has_wake_word(wake_text):
+                        clear_audio_queue()
+                        audio_remainder = b""
+                        continue
+
+                    # Detectó "edith", pero NO respondemos todavía.
+                    # Ahora capturamos audio extra para ver si la pregunta venía pegada.
+                    extra_audio = collect_after_wake_audio(1.8)
+                    combined_audio = total_audio + extra_audio
+
+                    full_text = transcribe_vosk_audio(
+                        combined_audio,
+                        use_noise_suppression=False
+                    )
+
+                    full_text = normalize_awake_command_text(full_text)
+
+                    words = full_text.split()
+
+                    if words and words[0] in WAKE_WORDS:
+                        command_after_wake = " ".join(words[1:]).strip()
+                    else:
+                        command_after_wake = ""
+
+                    command_after_wake = normalize_awake_command_text(command_after_wake)
+
+                    if command_after_wake and looks_like_command(command_after_wake):
+                        print(f"\nCOMANDO DIRECTO: edith {command_after_wake}")
+
+                        waiting_for_command = False
+                        full_command = f"edith {command_after_wake}"
+                        process_and_speak(full_command)
+
+                        clear_audio_queue()
+                        audio_remainder = b""
+                        continue
+
+                    # Si de verdad solo dijo "edith", entonces queda esperando,
+                    # pero SIN decir "A su orden" ni molestar.
+                    waiting_for_command = True
+                    last_wake_time = time.time()
+
+                    print("\nEDITH activa. Esperando pregunta...")
+
+                    clear_audio_queue()
+                    audio_remainder = b""
+                    continue
+                # MODO DESPIERTA:
+                # Aquí sí transcribe comando completo.
+                # Tomamos un pedacito extra para evitar cortar comandos como "que eres".
+                extra_audio = collect_extra_audio(0.35)
+                total_audio = total_audio + extra_audio
+
+                text = transcribe_vosk_audio(
+                    total_audio,
+                    use_noise_suppression=False
+                )
+
+                text = normalize_awake_command_text(text)
+
+                utterance_frames = []
+                silence_frames = 0
+                speech_frames = 0
 
                 if not text:
                     continue
 
-                print(f"\nRAW VOSK: {raw_text}")
-                print(f"NORMALIZADO: {text}")
+                print(f"\nCOMANDO DETECTADO: {text}")
 
-                now = time.time()
-
-                # Si está esperando comando y se acabó el tiempo
                 if waiting_for_command and now - last_wake_time > command_timeout:
                     waiting_for_command = False
                     print("EDITH volvió a modo espera.")
+                    clear_audio_queue()
+                    audio_remainder = b""
                     continue
 
-                words = text.split()
-                first_word = words[0] if words else ""
+                if not looks_like_command(text):
+                    print("No detecté un comando claro. Sigo escuchando, señor.")
+                    last_wake_time = time.time()
+                    clear_audio_queue()
+                    audio_remainder = b""
+                    continue
 
-                # Modo dormida: solo reacciona a wake word
-                if not waiting_for_command:
-                    if first_word in WAKE_WORDS:
-                        command_after_wake = " ".join(words[1:]).strip()
+                waiting_for_command = False
 
-                        play_sound("sounds/activate.mp3")
+                full_command = f"edith {text}"
+                process_and_speak(full_command)
 
-                        if command_after_wake:
-                            waiting_for_command = False
-                            full_command = f"edith {command_after_wake}"
-                            process_and_speak(full_command)
-
-                        else:
-                            waiting_for_command = True
-                            last_wake_time = now
-
-                            answer = f"A su orden, {USER_NAME}."
-                            print(f"EDITH: {answer}")
-                            speak(answer)
-
-                    else:
-                        print("Ruido/frase ignorada. EDITH dormida.")
-
-                # Modo despierta: procesa lo siguiente que digas sin repetir Edith
-                else:
-
-                    waiting_for_command = False
-
-                    audio_path = record_command(6)
-
-                    transcribed = transcribe_audio_gemini(audio_path)
-
-                    if not transcribed:
-                        print("No pude entender el comando.")
-                        continue
-
-                    print(f"\nTRANSCRIPCIÓN GEMINI: {transcribed}")
-
-                    full_command = f"edith {transcribed}"
-
-                    process_and_speak(full_command)
+                clear_audio_queue()
+                audio_remainder = b""
 
 def get_command(text):
     words = normalize(text).split()
@@ -527,6 +977,10 @@ def quick_answer(command):
     if "como estas" in text:
         return "Operativa y lista para asistirle, señor."
     if "quien eres" in text:
+        return "Soy EDITH, su asistente personal integrada en gafas inteligentes."
+    if "como te llamas" in text or "cual es tu nombre" in text:
+        return "Me llamo EDITH, señor."
+    if "que eres" in text:
         return "Soy EDITH, su asistente personal integrada en gafas inteligentes."
     if "que puedes hacer" in text:
         return "Puedo responder preguntas, abrir Spotify, resolver fórmulas y asistirle con información rápida, señor."
@@ -1228,17 +1682,41 @@ def process(raw):
     return response
 
 def process_and_speak(raw):
-    start = time.time()
-    answer = process(raw)
-    elapsed = round(time.time() - start, 2)
+    global LAST_INTERACTION_TIME
+    global SYSTEM_BUSY
 
-    if answer is None:
-        print("EDITH dormida. Use: edith ...")
+    if SYSTEM_BUSY:
+        print("EDITH ocupada. Espere un momento, señor.")
         return
 
-    print(f"Tiempo: {elapsed}s")
-    print(f"EDITH: {answer}")
-    speak(answer)
+    SYSTEM_BUSY = True
+
+    try:
+        clear_audio_queue()
+
+        start = time.time()
+
+        print("EDITH pensando...")
+
+        answer = process(raw)
+
+        elapsed = round(time.time() - start, 2)
+
+        if answer is None:
+            print("EDITH dormida. Use: edith ...")
+            return
+
+        print(f"Tiempo: {elapsed}s")
+        print(f"EDITH: {answer}")
+
+        speak(answer)
+
+        LAST_INTERACTION_TIME = time.time()
+
+        clear_audio_queue()
+
+    finally:
+        SYSTEM_BUSY = False
 
 def text_input_loop():
 
