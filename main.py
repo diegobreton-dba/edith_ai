@@ -15,7 +15,10 @@ import webrtcvad
 import numpy as np
 import noisereduce as nr
 import soundfile as sf
-from vosk import Model, KaldiRecognizer
+from vosk import Model, KaldiRecognizer, SetLogLevel
+
+SetLogLevel(-1)
+
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -29,7 +32,31 @@ GEMINI_MODELS = [
 CURRENT_GEMINI_MODEL = None
 LOCAL_MODEL = "gemma3:1b"
 WAKE_WORDS = ["edith", "edit", "edid", "edif"]
-WAKE_GRAMMAR = json.dumps(WAKE_WORDS + ["[unk]"], ensure_ascii=False)
+
+# Para Vosk grammar usamos solo palabras que el modelo reconoce.
+# edid/edif se quedan para texto normal, pero no en grammar.
+WAKE_GRAMMAR_WORDS = ["edith", "edit", "[unk]"]
+WAKE_GRAMMAR = json.dumps(WAKE_GRAMMAR_WORDS, ensure_ascii=False)
+COMMAND_GRAMMAR_PHRASES = [
+    "como te sientes",
+    "como estas",
+    "quien eres",
+    "que eres",
+    "como te llamas",
+    "cual es tu nombre",
+    "quien te creo",
+    "que puedes hacer",
+    "estado del sistema",
+    "modo examen",
+    "termina el examen",
+    "desactiva el modo examen",
+    "que es blockchain",
+    "que significa ser estoico",
+    "que significa ser paciente",
+    "[unk]"
+]
+
+COMMAND_GRAMMAR = json.dumps(COMMAND_GRAMMAR_PHRASES, ensure_ascii=False)
 VOICE_ENABLED = True
 VOICE = "es-ES-ElviraNeural"
 VOICE_RATE = "+5%"
@@ -60,18 +87,19 @@ VAD_MODE = 2
 vad = webrtcvad.Vad(VAD_MODE)
 
 MIN_SPEECH_FRAMES = 8
-END_SILENCE_FRAMES = 14
 
-MAX_UTTERANCE_SECONDS = 9
+MAX_UTTERANCE_SECONDS = 4
 MAX_UTTERANCE_BYTES = SAMPLE_RATE * 2 * MAX_UTTERANCE_SECONDS
 
-DORMANT_MAX_UTTERANCE_SECONDS = 3
-DORMANT_MAX_UTTERANCE_BYTES = SAMPLE_RATE * 2 * DORMANT_MAX_UTTERANCE_SECONDS
+END_SILENCE_FRAMES = 10
+
+DORMANT_MAX_UTTERANCE_SECONDS = 4.5
+DORMANT_MAX_UTTERANCE_BYTES = int(SAMPLE_RATE * 2 * DORMANT_MAX_UTTERANCE_SECONDS)
 LAST_INTERACTION_TIME = 0
 FOLLOWUP_WINDOW = 5
 
 SYSTEM_BUSY = False
-ACK_VOICE_ON_WAKE = False
+ACK_VOICE_ON_WAKE = True
 
 NOISE_SUPPRESSION_ENABLED = False
 NOISE_REDUCTION_STRENGTH = 0.35
@@ -164,7 +192,19 @@ def normalize_awake_command_text(text):
 
     if text == "quien es":
         return "quien eres"
+    
+    replacements = {
+        "como trajeran reci": "como te sientes",
+        "como trajeran": "como te sientes",
+        "como trajeron reci": "como te sientes",
+        "como te siente": "como te sientes",
+        "como se siente": "como te sientes",
+        "como te sienta": "como te sientes",
+        "como te sientes": "como te sientes",
+    }
 
+    if text in replacements:
+        return replacements[text]
     return text
 
 def ideal_length(text):
@@ -626,6 +666,73 @@ def transcribe_wake_audio(audio_bytes):
     except Exception:
         return ""
 
+def is_suspicious_short_command(text):
+    text = normalize(text)
+
+    if not text:
+        return True
+
+    suspicious_words = [
+        "trajeran",
+        "trajeron",
+        "reci",
+        "recio",
+        "resí",
+        "resi",
+        "traje",
+        "trajes"
+    ]
+
+    if text.startswith("como ") and any(w in text for w in suspicious_words):
+        return True
+
+    if len(text.split()) <= 1 and text not in WAKE_WORDS:
+        return True
+
+    return False
+
+
+def transcribe_command_audio(audio_bytes):
+    if not audio_bytes:
+        return ""
+
+    raw_text = transcribe_vosk_audio(
+        audio_bytes,
+        use_noise_suppression=False
+    )
+
+    raw_text = normalize_awake_command_text(raw_text)
+
+    if raw_text and looks_like_command(raw_text) and not is_suspicious_short_command(raw_text):
+        return raw_text
+
+    try:
+        command_recognizer = KaldiRecognizer(
+            VOSK_MODEL,
+            SAMPLE_RATE,
+            COMMAND_GRAMMAR
+        )
+
+        command_recognizer.AcceptWaveform(audio_bytes)
+
+        result = json.loads(
+            command_recognizer.FinalResult()
+        )
+
+        grammar_text = normalize(
+            result.get("text", "")
+        )
+
+        grammar_text = grammar_text.replace("[unk]", "").strip()
+        grammar_text = normalize_awake_command_text(grammar_text)
+
+        if grammar_text and looks_like_command(grammar_text):
+            return grammar_text
+
+    except Exception:
+        pass
+
+    return raw_text
 
 def has_wake_word(text):
     words = normalize(text).split()
@@ -635,6 +742,17 @@ def has_wake_word(text):
         for word in words
     )
 
+def extract_command_after_wake(text):
+    words = normalize(text).split()
+
+    if not words:
+        return ""
+
+    for i, word in enumerate(words):
+        if word in WAKE_WORDS:
+            return " ".join(words[i + 1:]).strip()
+
+    return ""
 
 def looks_like_command(text):
     text = normalize_awake_command_text(text)
@@ -804,7 +922,7 @@ def listen_microphone():
                 total_audio = b"".join(utterance_frames)
 
                 current_limit = (
-                    MAX_UTTERANCE_BYTES
+                    int(SAMPLE_RATE * 2 * 3.2)
                     if waiting_for_command
                     else DORMANT_MAX_UTTERANCE_BYTES
                 )
@@ -852,14 +970,25 @@ def listen_microphone():
 
                     full_text = normalize_awake_command_text(full_text)
 
-                    words = full_text.split()
-
-                    if words and words[0] in WAKE_WORDS:
-                        command_after_wake = " ".join(words[1:]).strip()
-                    else:
-                        command_after_wake = ""
-
+                    command_after_wake = extract_command_after_wake(full_text)
                     command_after_wake = normalize_awake_command_text(command_after_wake)
+
+                    # Si Vosk solo reconoció "edith", intentamos escuchar un poco más,
+                    # porque en micrófonos Bluetooth puede separar la wake word del comando.
+                    if not command_after_wake:
+                        extra_audio_2 = collect_after_wake_audio(2.2)
+                        combined_audio_2 = combined_audio + extra_audio_2
+
+                        full_text_2 = transcribe_vosk_audio(
+                            combined_audio_2,
+                            use_noise_suppression=False
+                        )
+
+                        command_after_wake = extract_command_after_wake(full_text_2)
+                        command_after_wake = normalize_awake_command_text(command_after_wake)
+
+                        if command_after_wake:
+                            full_text = full_text_2
 
                     if command_after_wake and looks_like_command(command_after_wake):
                         print(f"\nCOMANDO DIRECTO: edith {command_after_wake}")
@@ -879,6 +1008,11 @@ def listen_microphone():
 
                     print("\nEDITH activa. Esperando pregunta...")
 
+                    if ACK_VOICE_ON_WAKE:
+                        answer = f"A su orden, {USER_NAME}."
+                        print(f"EDITH: {answer}")
+                        speak(answer)
+
                     clear_audio_queue()
                     audio_remainder = b""
                     continue
@@ -888,11 +1022,7 @@ def listen_microphone():
                 extra_audio = collect_extra_audio(0.35)
                 total_audio = total_audio + extra_audio
 
-                text = transcribe_vosk_audio(
-                    total_audio,
-                    use_noise_suppression=False
-                )
-
+                text = transcribe_command_audio(total_audio)
                 text = normalize_awake_command_text(text)
 
                 utterance_frames = []
@@ -976,6 +1106,8 @@ def quick_answer(command):
         return "Modo examen activo, señor." if exam_mode else "Modo examen inactivo, señor."
     if "como estas" in text:
         return "Operativa y lista para asistirle, señor."
+    if "como te sientes" in text or "como te encuentras" in text:
+        return "No experimento emociones humanas, señor, pero mis sistemas están operativos y enfocados en asistirle."
     if "quien eres" in text:
         return "Soy EDITH, su asistente personal integrada en gafas inteligentes."
     if "como te llamas" in text or "cual es tu nombre" in text:

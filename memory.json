@@ -19,6 +19,10 @@
     {
       "u": "que es",
       "a": "Ser X significa poseer o tener una cualidad particular que define a una persona o cosa."
+    },
+    {
+      "u": "como trajeran reci",
+      "a": "La confección de ropa requiere un ajuste preciso y la consideración de varios factores, como el tipo de prenda, el material y el estilo. Es fundamental seguir las instrucciones del fabricante y, si es necesario, buscar la ayuda de un profesional."
     }
   ],
   "current_topic": "blockchain",
@@ -44,6 +48,7 @@
     "normal:blockchain:como te sientes": "Como un programa de ordenador, no experimento emociones.",
     "normal:blockchain:como te llamas": "Soy Edith, tu asistente de gafas inteligentes.",
     "normal:blockchain:si tu cuerpo": "Un dispositivo de visión.",
-    "normal:blockchain:que es": "Ser X significa poseer o tener una cualidad particular que define a una persona o cosa."
+    "normal:blockchain:que es": "Ser X significa poseer o tener una cualidad particular que define a una persona o cosa.",
+    "normal:blockchain:como trajeran reci": "La confección de ropa requiere un ajuste preciso y la consideración de varios factores, como el tipo de prenda, el material y el estilo. Es fundamental seguir las instrucciones del fabricante y, si es necesario, buscar la ayuda de un profesional."
   }
 }
